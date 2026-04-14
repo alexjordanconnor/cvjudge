@@ -1,7 +1,8 @@
 "use client";
 
-import { DndContext, DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { SortableContext, arrayMove, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { useState } from "react";
+import { useDroppable } from "@dnd-kit/core";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { AddTeamInlineForm } from "@/components/AddTeamInlineForm";
 import { TeamRow } from "@/components/TeamRow";
 import { Timer } from "@/components/Timer";
@@ -9,7 +10,7 @@ import { RoomTimerRow, TeamRow as Team, TeamStatus } from "@/lib/types";
 
 type RoomViewMode = "all" | "in_room" | "stage" | "hallway" | "queue" | "judged";
 
-export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, onUpdateStatus, onMoveRoom, onNoShow, onReorderQueue, onAddTeam, onTimer }: {
+export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, onUpdateStatus, onMoveRoom, onNoShow, onAddTeam, onTimer }: {
   roomNumber: number;
   roomCount: number;
   teams: Team[];
@@ -19,7 +20,6 @@ export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, o
   onUpdateStatus: (teamId: string, status: TeamStatus) => void;
   onMoveRoom: (team: Team, room: number) => void;
   onNoShow: (team: Team) => void;
-  onReorderQueue: (ids: string[]) => void;
   onAddTeam: (payload: Record<string, string>) => Promise<void>;
   onTimer: {
     start: () => Promise<void>;
@@ -43,18 +43,10 @@ export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, o
   const finishWithChangeover = new Date(now + (secondsLeftCurrent + Math.max(0, nonJudgedCount - 1) * 6 * 60) * 1000);
 
   const formatClock = (d: Date) => d.toTimeString().slice(0, 5);
-
-  const sensors = useSensors(useSensor(PointerSensor));
-
-  const onDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
-    const oldIndex = queue.findIndex((q) => q.id === active.id);
-    const newIndex = queue.findIndex((q) => q.id === over.id);
-    if (oldIndex < 0 || newIndex < 0) return;
-    const reordered = arrayMove(queue, oldIndex, newIndex);
-    onReorderQueue(reordered.map((t) => t.id));
-  };
+  const [showFullQueue, setShowFullQueue] = useState(false);
+  const visibleQueue = showFullQueue ? queue : queue.slice(0, 3);
+  const hiddenCount = Math.max(0, queue.length - visibleQueue.length);
+  const { setNodeRef: setQueueDropRef } = useDroppable({ id: `queue-drop-${roomNumber}` });
 
   const renderRows = (rows: Team[]) => rows.map((team) => (
     <TeamRow
@@ -98,9 +90,9 @@ export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, o
       {(viewMode === "all" || viewMode === "queue") ? (
         <section className="mt-3 space-y-2">
           <h4 className="text-sm text-zinc-400">Queue</h4>
-          <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+          <div ref={setQueueDropRef} className="space-y-2 rounded-md border border-dashed border-zinc-800 p-2">
             <SortableContext items={queue.map((q) => q.id)} strategy={verticalListSortingStrategy}>
-              {queue.map((team) => (
+              {visibleQueue.map((team) => (
                 <TeamRow
                   key={team.id}
                   team={team}
@@ -112,7 +104,12 @@ export function RoomCard({ roomNumber, roomCount, teams, timer, now, viewMode, o
                 />
               ))}
             </SortableContext>
-          </DndContext>
+          </div>
+          {queue.length > 3 ? (
+            <button onClick={() => setShowFullQueue((v) => !v)} className="text-xs text-indigo-400">
+              {showFullQueue ? "Show less" : `View more (${hiddenCount} left)`}
+            </button>
+          ) : null}
           <AddTeamInlineForm onSubmit={onAddTeam} />
         </section>
       ) : null}

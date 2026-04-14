@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import { DndContext, DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { arrayMove } from "@dnd-kit/sortable";
 import { AddTeamModal } from "@/components/AddTeamModal";
 import { NoShowDrawer } from "@/components/NoShowDrawer";
 import { RoomCard } from "@/components/RoomCard";
@@ -20,8 +22,10 @@ export default function RoomsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"all" | "in_room" | "stage" | "hallway" | "queue" | "judged">("all");
   const [roomCountDraft, setRoomCountDraft] = useState(0);
+  const [roomConflict, setRoomConflict] = useState<{ incomingId: string; existingId: string } | null>(null);
 
   const [operator, setOperator] = useState("Unknown");
+  const sensors = useSensors(useSensor(PointerSensor));
 
   const load = useCallback(async () => {
     const [{ data: eventData }, { data: teamData }, { data: timerData }] = await Promise.all([
@@ -62,6 +66,14 @@ export default function RoomsPage() {
   const noShows = teams.filter((t) => t.status === "no_show");
 
   const updateStatus = async (teamId: string, status: TeamStatus) => {
+    if (status === "in_room") {
+      const incoming = teams.find((t) => t.id === teamId);
+      const existing = teams.find((t) => t.room_id === incoming?.room_id && t.status === "in_room" && t.id !== teamId);
+      if (incoming && existing) {
+        setRoomConflict({ incomingId: incoming.id, existingId: existing.id });
+        return;
+      }
+    }
     await supabase.from("teams").update({ status }).eq("id", teamId);
   };
 
@@ -113,6 +125,55 @@ export default function RoomsPage() {
     await load();
   };
 
+  const onQueueDrag = async (event: DragEndEvent) => {
+    const activeId = String(event.active.id);
+    const overId = event.over ? String(event.over.id) : "";
+    if (!overId || activeId === overId) return;
+
+    const activeTeam = teams.find((t) => t.id === activeId);
+    if (!activeTeam || activeTeam.status !== "queue") return;
+
+    const overTeam = teams.find((t) => t.id === overId);
+    const targetRoom = overId.startsWith("queue-drop-")
+      ? Number(overId.replace("queue-drop-", ""))
+      : overTeam?.room_id || activeTeam.room_id;
+    if (!targetRoom) return;
+
+    const sourceRoom = activeTeam.room_id || targetRoom;
+    const sourceQueue = teams
+      .filter((t) => t.room_id === sourceRoom && t.status === "queue" && t.id !== activeId)
+      .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+
+    const targetQueueCurrent = teams
+      .filter((t) => t.room_id === targetRoom && t.status === "queue" && t.id !== activeId)
+      .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+
+    if (sourceRoom === targetRoom) {
+      const sameRoomQueue = teams
+        .filter((t) => t.room_id === sourceRoom && t.status === "queue")
+        .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+      const oldIndex = sameRoomQueue.findIndex((t) => t.id === activeId);
+      const newIndex = sameRoomQueue.findIndex((t) => t.id === overId);
+      if (oldIndex < 0 || newIndex < 0) return;
+      const reordered = arrayMove(sameRoomQueue, oldIndex, newIndex);
+      await supabase.from("teams").upsert(reordered.map((team, idx) => ({ id: team.id, queue_position: idx })));
+      return;
+    }
+
+    const insertAt = overTeam && overTeam.status === "queue" && overTeam.room_id === targetRoom
+      ? targetQueueCurrent.findIndex((t) => t.id === overTeam.id)
+      : -1;
+
+    const targetQueue = [...targetQueueCurrent];
+    const movingTeam = { ...activeTeam, room_id: targetRoom };
+    if (insertAt >= 0) targetQueue.splice(insertAt, 0, movingTeam);
+    else targetQueue.push(movingTeam);
+
+    const sourcePayload = sourceQueue.map((t, idx) => ({ id: t.id, queue_position: idx, room_id: sourceRoom, status: "queue" }));
+    const targetPayload = targetQueue.map((t, idx) => ({ id: t.id, queue_position: idx, room_id: targetRoom, status: "queue" }));
+    await supabase.from("teams").upsert([...sourcePayload, ...targetPayload]);
+  };
+
   return (
     <main className="mx-auto max-w-7xl p-4">
       <nav className="mb-6 flex items-center justify-between gap-3">
@@ -145,7 +206,8 @@ export default function RoomsPage() {
         </div>
       </nav>
 
-      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <DndContext sensors={sensors} onDragEnd={(e) => void onQueueDrag(e)}>
+        <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {Array.from({ length: roomCount }).map((_, idx) => {
           const roomNumber = idx + 1;
           const roomTeams = teams.filter((t) => t.room_id === roomNumber && t.status !== "no_show");
@@ -168,10 +230,6 @@ export default function RoomsPage() {
                 await supabase.from("teams").update({ room_id: room, status: "queue", queue_position: max + 1 }).eq("id", team.id);
               }}
               onNoShow={(team) => void supabase.from("teams").update({ status: "no_show", original_room_id: team.original_room_id || team.room_id }).eq("id", team.id)}
-              onReorderQueue={async (ids) => {
-                const payload = ids.map((id, i) => ({ id, queue_position: i }));
-                await supabase.from("teams").upsert(payload);
-              }}
               onAddTeam={async (payload) => {
                 const max = teams.filter((t) => t.room_id === roomNumber && t.status === "queue").reduce((m, t) => Math.max(m, t.queue_position ?? 0), -1);
                 await supabase.from("teams").insert({ ...payload, event_id: eventId, room_id: roomNumber, status: "queue", queue_position: max + 1, original_room_id: roomNumber });
@@ -185,7 +243,8 @@ export default function RoomsPage() {
             />
           );
         })}
-      </section>
+        </section>
+      </DndContext>
 
       <NoShowDrawer
         open={drawerOpen}
@@ -208,6 +267,40 @@ export default function RoomsPage() {
           await supabase.from("teams").insert({ ...payload, event_id: eventId, room_id: room, status: "queue", queue_position: max + 1, original_room_id: room });
         }}
       />
+
+      {roomConflict ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4">
+          <div className="card w-full max-w-md rounded-xl p-4">
+            <h3 className="text-lg font-semibold">Team already in room</h3>
+            <p className="mt-2 text-sm text-zinc-300">
+              This room already has a team currently marked as in-room. Choose how to resolve before bringing the next team in.
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                className="rounded bg-green-700 px-3 py-1 text-sm"
+                onClick={async () => {
+                  await supabase.from("teams").update({ status: "finished" }).eq("id", roomConflict.existingId);
+                  await supabase.from("teams").update({ status: "in_room" }).eq("id", roomConflict.incomingId);
+                  setRoomConflict(null);
+                }}
+              >
+                Mark current as judged
+              </button>
+              <button
+                className="rounded bg-amber-700 px-3 py-1 text-sm"
+                onClick={async () => {
+                  await supabase.from("teams").update({ status: "hallway" }).eq("id", roomConflict.existingId);
+                  await supabase.from("teams").update({ status: "in_room" }).eq("id", roomConflict.incomingId);
+                  setRoomConflict(null);
+                }}
+              >
+                Move current to hallway
+              </button>
+              <button className="rounded bg-zinc-800 px-3 py-1 text-sm" onClick={() => setRoomConflict(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
