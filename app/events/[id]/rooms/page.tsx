@@ -18,6 +18,8 @@ export default function RoomsPage() {
   const [now, setNow] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
+  const [viewMode, setViewMode] = useState<"all" | "in_room" | "stage" | "hallway" | "queue" | "judged">("all");
+  const [roomCountDraft, setRoomCountDraft] = useState(0);
 
   const [operator, setOperator] = useState("Unknown");
 
@@ -28,6 +30,7 @@ export default function RoomsPage() {
       supabase.from("room_timers").select("*").eq("event_id", eventId).order("room_number"),
     ]);
     setEvent(eventData);
+    setRoomCountDraft(eventData?.room_count || 0);
     setTeams((teamData as TeamRow[]) || []);
     setTimers((timerData as RoomTimerRow[]) || []);
   }, [eventId]);
@@ -64,12 +67,77 @@ export default function RoomsPage() {
 
   const roomCount = event?.room_count || 0;
 
+  const updateRoomCount = async () => {
+    if (!event || roomCountDraft < 1 || roomCountDraft > 10 || roomCountDraft === roomCount) return;
+
+    await supabase.from("events").update({ room_count: roomCountDraft }).eq("id", event.id);
+
+    if (roomCountDraft > roomCount) {
+      const newTimers = Array.from({ length: roomCountDraft - roomCount }).map((_, i) => ({
+        event_id: event.id,
+        room_number: roomCount + i + 1,
+        duration_seconds: 300,
+        is_running: false,
+      }));
+      if (newTimers.length) await supabase.from("room_timers").insert(newTimers);
+    } else {
+      const roomsToRemove = Array.from({ length: roomCount - roomCountDraft }).map((_, i) => roomCountDraft + i + 1);
+      if (roomsToRemove.length) {
+        const overflowTeams = teams
+          .filter((t) => (t.room_id || 0) > roomCountDraft && t.status !== "no_show")
+          .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+
+        if (overflowTeams.length) {
+          const queueByRoom = Array.from({ length: roomCountDraft }).map((_, idx) =>
+            teams.filter((t) => t.room_id === idx + 1 && t.status === "queue").length,
+          );
+
+          const updates = overflowTeams.map((team, idx) => {
+            const targetRoom = (idx % roomCountDraft) + 1;
+            const nextPos = queueByRoom[targetRoom - 1];
+            queueByRoom[targetRoom - 1] += 1;
+            return {
+              id: team.id,
+              room_id: targetRoom,
+              status: "queue",
+              queue_position: nextPos,
+            };
+          });
+          await supabase.from("teams").upsert(updates);
+        }
+
+        await supabase.from("room_timers").delete().eq("event_id", event.id).in("room_number", roomsToRemove);
+      }
+    }
+
+    await load();
+  };
+
   return (
     <main className="mx-auto max-w-7xl p-4">
       <nav className="mb-6 flex items-center justify-between gap-3">
         <Link href="/events" className="text-xl font-semibold">Judge.run</Link>
         <div className="text-lg">{event?.name || "Event"}</div>
         <div className="flex items-center gap-2 text-sm text-zinc-300">
+          <select value={viewMode} onChange={(e) => setViewMode(e.target.value as typeof viewMode)} className="rounded bg-zinc-900 px-2 py-1">
+            <option value="all">View Rooms</option>
+            <option value="in_room">View Room</option>
+            <option value="stage">View Stage</option>
+            <option value="hallway">View Hall</option>
+            <option value="queue">View Queue</option>
+            <option value="judged">View Judged</option>
+          </select>
+          <div className="flex items-center gap-1">
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={roomCountDraft || ""}
+              onChange={(e) => setRoomCountDraft(Number(e.target.value))}
+              className="w-16 rounded bg-zinc-900 px-2 py-1"
+            />
+            <button onClick={() => void updateRoomCount()} className="rounded bg-zinc-800 px-2 py-1">Update Rooms</button>
+          </div>
           <span>Operating as: {operator}</span>
           <button onClick={() => setDrawerOpen((v) => !v)} className="rounded bg-zinc-800 px-2 py-1">No Shows ({noShows.length})</button>
           <button onClick={() => setModalOpen(true)} className="rounded bg-indigo-500 px-2 py-1">+ Add Team</button>
@@ -92,6 +160,7 @@ export default function RoomsPage() {
               teams={roomTeams}
               timer={timer}
               now={now}
+              viewMode={viewMode}
               onUpdateStatus={(teamId, status) => void updateStatus(teamId, status)}
               onMoveRoom={async (team, room) => {
                 if (room === team.room_id) return;
